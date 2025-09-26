@@ -1,0 +1,29 @@
+================================================================================
+REPORTE COMPLETO DEL SISTEMA PREDICTIVO INDUSTRIAL
+Generado: 2025-09-11 18:18:55
+================================================================================
+
+[ESTADO DEL SISTEMA]
+  ✅ Inicializado: OK
+  ✅ Modelos Entrenados: OK
+  ❌ Validacion Ok: PENDIENTE
+  ✅ En Produccion: OK
+
+[DATOS HISTÓRICOS]
+  Total registros: 105,123
+  Columnas: 20
+  Período: 2024-04-30 a 2025-04-30
+
+[CONFIGURACIÓN USUARIOS]
+  Horizonte mínimo: 15 minutos
+  Horizonte máximo: 24 horas
+  Confianza objetivo: 80.0%
+  Precisión mínima: 70.0%
+  Indicadores prioritarios: IVM, IET, IIPNP
+
+[MODELOS PREDICTIVOS]
+  IVM: ✅ ENTRENADO
+    Precisión: 56.6%
+  IET: ✅ ENTRENADO
+    Precisión: 88.7%
+  IPC: ❌ NO ENTRENADO

@@ -1,0 +1,22 @@
+================================================================================
+SISTEMA PREDICTIVO INDUSTRIAL - ANALISIS DE DATOS REALES
+Iniciado: 2025-09-10 12:38:42
+Archivo fuente: datos.csv
+================================================================================
+
+[INFORMACION DE DATOS CARGADOS]
+--------------------------------------------------
+Total registros: 105123
+Columnas disponibles: 1
+
+[INDICADORES CALCULADOS - DATOS REALES]
+--------------------------------------------------
+IVM: ERROR - Columna 'T. de Microparadas' no encontrada
+IET: ERROR - Columna 'T. Disponible' no encontrada
+IIPNP: ERROR - Columna 'T. de P. No Programada' no encontrada
+IPC: ERROR - Columna 'Conteo' no encontrada
+[ESTADISTICAS ADICIONALES]
+--------------------------------------------------
+
+[FINALIZACION]: 2025-09-10 12:38:42
+[DURACION]: 0.02 segundos
