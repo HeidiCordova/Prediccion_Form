@@ -183,8 +183,6 @@ class SistemaPredictivoIndustrial:
                     resultado = resultados_historicos[indicador]
                     if 'error' not in resultado:
                         valor = resultado['valor']
-                        estado = self._evaluar_estado_indicador(indicador, valor)
-                        self.logger.info(f"{indicador}: {valor}% - {estado}")
                     else:
                         self.logger.error(f"{indicador}: {resultado['error']}")
             
@@ -287,8 +285,9 @@ class SistemaPredictivoIndustrial:
             self.logger.error(f"Error configurando producción: {e}")
             return {'estado': 'ERROR', 'detalle': str(e)}
     
+   
     def realizar_prediccion_completa(self, horizonte_horas: int = 2) -> Dict[str, any]:
-        """Realizar predicción completa con todos los indicadores"""
+        """Realizar predicción completa con todos los indicadores - SOLO VALORES NUMÉRICOS"""
         if not self.estado_sistema['en_produccion']:
             raise ValueError("Sistema no está en producción. Ejecutar inicializar_sistema_completo() primero.")
         
@@ -303,53 +302,25 @@ class SistemaPredictivoIndustrial:
                 datos_recientes, horizonte_horas
             )
             
-            # Analizar resultados
-            alertas_criticas = []
-            alertas_atencion = []
-            indicadores_normales = []
-            
+            # Log de predicciones obtenidas
             for nombre, prediccion in predicciones.items():
-                if prediccion is None:
-                    continue
-                    
-                if prediccion.estado == 'CRITICO':
-                    alertas_criticas.append({
-                        'indicador': nombre,
-                        'valor_predicho': prediccion.valor_predicho,
-                        'probabilidad_alerta': prediccion.probabilidad_alerta,
-                        'recomendaciones': prediccion.recomendaciones
-                    })
-                elif prediccion.estado == 'ALERTA':
-                    alertas_atencion.append({
-                        'indicador': nombre,
-                        'valor_predicho': prediccion.valor_predicho,
-                        'probabilidad_alerta': prediccion.probabilidad_alerta
-                    })
+                if prediccion is not None:
+                    self.logger.info(f"Predicción {nombre}: {prediccion.valor_predicho}")
                 else:
-                    indicadores_normales.append(nombre)
+                    self.logger.warning(f"No se pudo generar predicción para {nombre}")
             
-            # Generar reporte simplificado para usuarios
-            reporte = self._generar_reporte_usuario_final(
-                predicciones, alertas_criticas, alertas_atencion, indicadores_normales, horizonte_horas
-            )
+            # Generar reporte simple con valores predichos
+            reporte = self._generar_reporte_usuario_simple(predicciones, horizonte_horas)
             
             resultado = {
                 'timestamp': datetime.datetime.now(),
                 'horizonte_horas': horizonte_horas,
                 'predicciones': predicciones,
-                'alertas_criticas': alertas_criticas,
-                'alertas_atencion': alertas_atencion,
-                'indicadores_normales': indicadores_normales,
                 'reporte_usuario': reporte,
-                'estado_general': 'CRITICO' if alertas_criticas else 'ATENCION' if alertas_atencion else 'NORMAL'
+                'total_predicciones': len([p for p in predicciones.values() if p is not None])
             }
             
-            # Log simplificado
-            self.logger.info(f"Predicción completada - Estado: {resultado['estado_general']}")
-            if alertas_criticas:
-                self.logger.critical(f"🔴 ALERTAS CRÍTICAS: {len(alertas_criticas)}")
-            if alertas_atencion:
-                self.logger.warning(f"🟡 ALERTAS ATENCIÓN: {len(alertas_atencion)}")
+            self.logger.info(f"Predicción completada - {resultado['total_predicciones']} indicadores predichos")
             
             return resultado
             
@@ -357,72 +328,58 @@ class SistemaPredictivoIndustrial:
             self.logger.error(f"Error en predicción completa: {e}")
             return {'error': str(e)}
     
-    def _generar_reporte_usuario_final(self, predicciones, alertas_criticas, alertas_atencion, indicadores_normales, horizonte_horas) -> str:
-        """Generar reporte simplificado para usuarios finales (basado en encuesta)"""
+   
+    def _generar_reporte_usuario_simple(self, predicciones, horizonte_horas) -> str:
+        """Generar reporte simple solo con valores predichos"""
         output = []
         
         # Encabezado simple
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
-        output.append(f"🔮 PREDICCIÓN INDUSTRIAL - {timestamp}")
-        output.append(f"⏱️ Horizonte: {horizonte_horas} horas")
+        output.append(f"PREDICCIÓN INDUSTRIAL - {timestamp}")
+        output.append(f"Horizonte: {horizonte_horas} horas")
         output.append("")
         
-        # Resumen ejecutivo (lo que más necesitan según encuesta)
-        if alertas_criticas:
-            output.append("🔴 ACCIÓN INMEDIATA REQUERIDA")
-            for alerta in alertas_criticas:
-                output.append(f"  • {alerta['indicador']}: {alerta['valor_predicho']} - Riesgo {alerta['probabilidad_alerta']}%")
-                if alerta['recomendaciones']:
-                    output.append(f"    ➤ {alerta['recomendaciones'][0]}")  # Solo la primera recomendación
-            output.append("")
+        # Mostrar predicciones obtenidas
+        output.append("VALORES PREDICHOS:")
+        output.append("-" * 30)
         
-        elif alertas_atencion:
-            output.append("🟡 MONITOREO REQUERIDO")
-            for alerta in alertas_atencion:
-                output.append(f"  • {alerta['indicador']}: {alerta['valor_predicho']} - Atención {alerta['probabilidad_alerta']}%")
-            output.append("")
-        
-        else:
-            output.append("✅ OPERACIÓN NORMAL PREDICHA")
-            output.append("")
-        
-        # Detalles por indicador prioritario (según encuesta)
-        indicadores_mostrar = ['IVM', 'IIPNP', 'IET']  # Orden de prioridad según encuesta
-        
-        for indicador in indicadores_mostrar:
-            if indicador in predicciones:
+        for indicador in ['IVM', 'IET', 'IPC']:
+            if indicador in predicciones and predicciones[indicador] is not None:
                 pred = predicciones[indicador]
-                if pred is not None:
-                    emoji = "🔴" if pred.estado == 'CRITICO' else "🟡" if pred.estado == 'ALERTA' else "✅"
-                    output.append(f"{emoji} {indicador}: {pred.valor_predicho} (Confianza: {pred.confianza}%)")
+                anomalia_tag = " (ANOMALÍA)" if pred.es_anomalia else ""
+                output.append(f"{indicador}: {pred.valor_predicho:.2f} (Confianza: {pred.confianza:.1f}%){anomalia_tag}")
+            else:
+                output.append(f"{indicador}: No disponible")
         
         # Próxima actualización
         proxima_actualizacion = datetime.datetime.now() + datetime.timedelta(hours=1)
         output.append("")
-        output.append(f"🔄 Próxima actualización: {proxima_actualizacion.strftime('%H:%M')}")
+        output.append(f"Próxima actualización: {proxima_actualizacion.strftime('%H:%M')}")
         
         return '\n'.join(output)
     
+
     def monitoreo_tiempo_real(self, intervalo_minutos: int = 60):
-        """Simular monitoreo en tiempo real (para demostración)"""
+        """Monitoreo en tiempo real simplificado - solo valores"""
         self.logger.info(f"Iniciando monitoreo cada {intervalo_minutos} minutos...")
-        
-        # En un sistema real, esto correría en un loop continuo o tarea programada
-        # Para demostración, ejecutamos una vez
         
         try:
             resultado = self.realizar_prediccion_completa(horizonte_horas=2)
             
-            if resultado.get('estado_general') in ['CRITICO', 'ATENCION']:
-                # Simular notificación (email, SMS, dashboard, etc.)
-                self.logger.info("📱 NOTIFICACIÓN ENVIADA A USUARIOS")
-                
-                # Mostrar reporte de usuario
+            if 'error' not in resultado:
+                # Mostrar reporte simple
                 print("\n" + "="*60)
-                print("ALERTA AUTOMÁTICA DEL SISTEMA")
+                print("REPORTE AUTOMÁTICO DEL SISTEMA")
                 print("="*60)
                 print(resultado['reporte_usuario'])
                 print("="*60)
+                
+                # Log adicional de predicciones con anomalías
+                for nombre, pred in resultado['predicciones'].items():
+                    if pred is not None and pred.es_anomalia:
+                        self.logger.warning(f"ANOMALÍA detectada en {nombre}: {pred.valor_predicho}")
+            else:
+                self.logger.error(f"Error en monitoreo: {resultado['error']}")
             
             return resultado
             
@@ -430,31 +387,7 @@ class SistemaPredictivoIndustrial:
             self.logger.error(f"Error en monitoreo tiempo real: {e}")
             return {'error': str(e)}
     
-    def _evaluar_estado_indicador(self, indicador: str, valor: float) -> str:
-        """Evaluar estado de un indicador basado en umbrales"""
-        umbrales = {
-            'IVM': {'critico': 50, 'alerta': 30},
-            'IET': {'critico': 70, 'alerta': 80},
-            'IPC': {'critico': 60, 'alerta': 75}
-        }
-        
-        if indicador not in umbrales:
-            return 'DESCONOCIDO'
-        
-        if indicador == 'IVM':  # Para IVM, mayor es peor
-            if valor >= umbrales[indicador]['critico']:
-                return 'CRITICO'
-            elif valor >= umbrales[indicador]['alerta']:
-                return 'ALERTA'
-            else:
-                return 'NORMAL'
-        else:  # Para IET e IPC, menor es peor
-            if valor <= umbrales[indicador]['critico']:
-                return 'CRITICO'
-            elif valor <= umbrales[indicador]['alerta']:
-                return 'ALERTA'
-            else:
-                return 'NORMAL'
+    
     
     def generar_reporte_completo_sistema(self) -> str:
         """Generar reporte completo del estado del sistema"""

@@ -23,16 +23,14 @@ logging.basicConfig(level=logging.INFO)
 
 @dataclass
 class PrediccionResultado:
-    """Resultado de predicción estructurado"""
+    """Resultado de predicción estructurado - Solo valores numéricos"""
     valor_predicho: float
     confianza: float
-    probabilidad_alerta: float
-    estado: str
+    es_anomalia: bool
     factores_influencia: Dict[str, float]
     horizonte_temporal: str
     timestamp: datetime.datetime
     metricas_modelo: Dict[str, float]
-    recomendaciones: List[str]
 
 class ModeloPrediccionBase(ABC):
     """Modelo base abstracto para predicciones industriales"""
@@ -45,19 +43,36 @@ class ModeloPrediccionBase(ABC):
         self.modelo_entrenado = False
         self.metricas_entrenamiento = {}
         self.logger = logging.getLogger(f"{self.__class__.__name__}")
-        
-        # Umbrales específicos por indicador
-        self.umbrales = self._definir_umbrales()
-        
-    def _definir_umbrales(self) -> Dict[str, float]:
-        """Definir umbrales específicos por indicador"""
-        umbrales_base = {
-            'IVM': {'critico': 50, 'alerta': 30, 'normal': 15},
-            'IET': {'critico': 70, 'alerta': 80, 'normal': 90},
-            'IPC': {'critico': 60, 'alerta': 75, 'normal': 85},
-            'IIPNP': {'critico': 20, 'alerta': 15, 'normal': 10}
-        }
-        return umbrales_base.get(self.nombre_indicador, {'critico': 50, 'alerta': 30, 'normal': 15})
+        self.detector_anomalias = None
+        self.contamination_calculada = None
+    
+    def _calcular_contamination_dinamico(self, datos: np.ndarray) -> float:
+        """Calcular contamination dinámicamente usando método IQR"""
+        try:
+            # Método IQR para detectar outliers
+            Q1 = np.percentile(datos, 25)
+            Q3 = np.percentile(datos, 75)
+            IQR = Q3 - Q1
+            
+            # Límites para outliers
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
+            
+            # Contar outliers
+            outliers = ((datos < lower_bound) | (datos > upper_bound))
+            contamination_rate = np.sum(outliers) / len(datos)
+            
+            # Límites razonables (entre 0.01 y 0.3)
+            contamination_final = max(0.01, min(0.3, contamination_rate))
+            
+            self.logger.info(f"Contamination calculada para {self.nombre_indicador}: {contamination_final:.3f} "
+                           f"({np.sum(outliers)} outliers de {len(datos)} datos)")
+            
+            return contamination_final
+            
+        except Exception as e:
+            self.logger.warning(f"Error calculando contamination dinámico: {e}. Usando valor por defecto 0.05")
+            return 0.05
     
     @abstractmethod
     def entrenar(self, datos: pd.DataFrame) -> Dict[str, float]:
@@ -75,7 +90,6 @@ class ModeloPrediccionBase(ABC):
             return {'error': 'Modelo no entrenado'}
         
         try:
-            # Implementar validación específica en clases derivadas
             return self.metricas_entrenamiento
         except Exception as e:
             self.logger.error(f"Error validando modelo: {e}")
@@ -87,7 +101,6 @@ class ModeloPrediccionIVM(ModeloPrediccionBase):
     def __init__(self, horizonte_horas: int = 2):
         super().__init__('IVM', horizonte_horas)
         self.modelo = RandomForestRegressor(n_estimators=100, random_state=42)
-        self.detector_anomalias = IsolationForest(contamination=0.1, random_state=42)
     
     def _crear_caracteristicas_temporales(self, datos: pd.DataFrame) -> pd.DataFrame:
         """Crear características temporales para predicción"""
@@ -171,7 +184,14 @@ class ModeloPrediccionIVM(ModeloPrediccionBase):
             # Entrenar modelo principal
             self.modelo.fit(X_train_scaled, y_train)
             
-            # Entrenar detector de anomalías
+            # Calcular contamination dinámicamente basado en datos de entrenamiento
+            self.contamination_calculada = self._calcular_contamination_dinamico(X_train_scaled.flatten())
+            
+            # Crear detector de anomalías con contamination calculada
+            self.detector_anomalias = IsolationForest(
+                contamination=self.contamination_calculada, 
+                random_state=42
+            )
             self.detector_anomalias.fit(X_train_scaled)
             
             # Calcular métricas
@@ -181,17 +201,18 @@ class ModeloPrediccionIVM(ModeloPrediccionBase):
                 'mae': mean_absolute_error(y_test, y_pred),
                 'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
                 'r2': r2_score(y_test, y_pred),
-                'precisión': max(0, min(100, 100 - mean_absolute_error(y_test, y_pred))),
                 'registros_entrenamiento': len(X_train),
                 'registros_prueba': len(X_test),
-                'caracteristicas_usadas': len(feature_cols)
+                'caracteristicas_usadas': len(feature_cols),
+                'contamination_calculada': self.contamination_calculada
             }
             
             self.modelo_entrenado = True
             self.feature_cols = feature_cols
             
             self.logger.info(f"Modelo IVM entrenado. R²: {self.metricas_entrenamiento['r2']:.3f}, "
-                           f"Precisión: {self.metricas_entrenamiento['precisión']:.1f}%")
+                           f"MAE: {self.metricas_entrenamiento['mae']:.2f}, "
+                           f"Contamination: {self.contamination_calculada:.3f}")
             
             return self.metricas_entrenamiento
             
@@ -218,23 +239,15 @@ class ModeloPrediccionIVM(ModeloPrediccionBase):
             # Realizar predicción
             valor_predicho = self.modelo.predict(X_pred_scaled)[0]
             
-            # Detectar anomalías
-            es_anomalia = self.detector_anomalias.predict(X_pred_scaled)[0] == -1
+            # Detectar anomalías solo si el detector está entrenado
+            es_anomalia = False
+            if self.detector_anomalias is not None:
+                es_anomalia = self.detector_anomalias.predict(X_pred_scaled)[0] == -1
             
-            # Calcular confianza
-            confianza_base = self.metricas_entrenamiento.get('precisión', 70)
+            # Calcular confianza basada en R²
+            r2_score_val = self.metricas_entrenamiento.get('r2', 0)
+            confianza_base = max(0, min(100, r2_score_val * 100))
             confianza = confianza_base * (0.8 if es_anomalia else 1.0)
-            
-            # Determinar estado y probabilidad de alerta
-            if valor_predicho >= self.umbrales['critico']:
-                estado = 'CRITICO'
-                probabilidad_alerta = 95
-            elif valor_predicho >= self.umbrales['alerta']:
-                estado = 'ALERTA'
-                probabilidad_alerta = 75
-            else:
-                estado = 'NORMAL'
-                probabilidad_alerta = 25
             
             # Factores de influencia (importancia de características)
             factores_influencia = {}
@@ -242,44 +255,19 @@ class ModeloPrediccionIVM(ModeloPrediccionBase):
                 for i, col in enumerate(self.feature_cols):
                     factores_influencia[col] = round(self.modelo.feature_importances_[i] * 100, 1)
             
-            # Generar recomendaciones
-            recomendaciones = self._generar_recomendaciones_ivm(valor_predicho, factores_influencia)
-            
             return PrediccionResultado(
-                valor_predicho=round(valor_predicho, 1),
+                valor_predicho=round(valor_predicho, 2),
                 confianza=round(confianza, 1),
-                probabilidad_alerta=probabilidad_alerta,
-                estado=estado,
+                es_anomalia=es_anomalia,
                 factores_influencia=factores_influencia,
                 horizonte_temporal=f"{self.horizonte_horas} horas",
                 timestamp=datetime.datetime.now(),
-                metricas_modelo=self.metricas_entrenamiento,
-                recomendaciones=recomendaciones
+                metricas_modelo=self.metricas_entrenamiento
             )
             
         except Exception as e:
             self.logger.error(f"Error en predicción IVM: {e}")
             raise
-    
-    def _generar_recomendaciones_ivm(self, valor_predicho: float, factores: Dict[str, float]) -> List[str]:
-        """Generar recomendaciones específicas para IVM"""
-        recomendaciones = []
-        
-        if valor_predicho >= self.umbrales['critico']:
-            recomendaciones.append("ACCIÓN INMEDIATA: Revisar sistema de microparadas")
-            recomendaciones.append("Verificar mantenimiento preventivo")
-        elif valor_predicho >= self.umbrales['alerta']:
-            recomendaciones.append("Monitorear tendencias de microparadas")
-            recomendaciones.append("Preparar intervención preventiva")
-        
-        # Recomendaciones basadas en factores
-        if factores.get('cambio_turno', 0) > 20:
-            recomendaciones.append("Optimizar transición entre turnos")
-        
-        if factores.get('microparadas_tendencia', 0) > 15:
-            recomendaciones.append("Investigar tendencia creciente de microparadas")
-        
-        return recomendaciones
 
 class ModeloPrediccionIET(ModeloPrediccionBase):
     """Modelo específico para predicción de IET (Índice de Eficiencia Temporal)"""
@@ -346,20 +334,31 @@ class ModeloPrediccionIET(ModeloPrediccionBase):
             
             self.modelo.fit(X_train_scaled, y_train)
             
+            # Calcular contamination dinámicamente
+            self.contamination_calculada = self._calcular_contamination_dinamico(X_train_scaled.flatten())
+            
+            # Crear detector de anomalías
+            self.detector_anomalias = IsolationForest(
+                contamination=self.contamination_calculada, 
+                random_state=42
+            )
+            self.detector_anomalias.fit(X_train_scaled)
+            
             # Métricas
             y_pred = self.modelo.predict(X_test_scaled)
             self.metricas_entrenamiento = {
                 'mae': mean_absolute_error(y_test, y_pred),
                 'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
                 'r2': r2_score(y_test, y_pred),
-                'precisión': max(0, min(100, 100 - mean_absolute_error(y_test, y_pred) / 100 * 100)),
-                'registros_entrenamiento': len(X_train)
+                'registros_entrenamiento': len(X_train),
+                'contamination_calculada': self.contamination_calculada
             }
             
             self.modelo_entrenado = True
             self.feature_cols = feature_cols
             
-            self.logger.info(f"Modelo IET entrenado. Precisión: {self.metricas_entrenamiento['precisión']:.1f}%")
+            self.logger.info(f"Modelo IET entrenado. R²: {self.metricas_entrenamiento['r2']:.3f}, "
+                           f"Contamination: {self.contamination_calculada:.3f}")
             
             return self.metricas_entrenamiento
             
@@ -372,20 +371,70 @@ class ModeloPrediccionIET(ModeloPrediccionBase):
         if not self.modelo_entrenado:
             raise ValueError("Modelo IET no entrenado")
         
-        # Implementación similar a IVM pero para IET
-        # [Código de predicción específico para IET]
-        
-        return PrediccionResultado(
-            valor_predicho=85.0,  # Placeholder
-            confianza=75.0,
-            probabilidad_alerta=30,
-            estado='NORMAL',
-            factores_influencia={},
-            horizonte_temporal=f"{self.horizonte_horas} horas",
-            timestamp=datetime.datetime.now(),
-            metricas_modelo=self.metricas_entrenamiento,
-            recomendaciones=["Mantener eficiencia actual"]
-        )
+        try:
+            # Filtrar y calcular IET actual
+            datos_validos = datos_entrada[
+                (datos_entrada['T. Disponible'].notna()) & 
+                (datos_entrada['T. Disponible'] > 0) &
+                (datos_entrada['T. de Microparadas'].notna()) &
+                (datos_entrada['T. de Microparadas'] >= 0)
+            ].copy()
+            
+            if len(datos_validos) == 0:
+                raise ValueError("No hay datos válidos para predicción IET")
+            
+            # Calcular IET actual
+            datos_validos['IET_actual'] = (
+                (datos_validos['T. Disponible'] - datos_validos['T. de Microparadas']) / 
+                datos_validos['T. Disponible']
+            ) * 100
+            
+            # Características temporales
+            if 'Fecha' in datos_validos.columns:
+                datos_validos['Fecha'] = pd.to_datetime(datos_validos['Fecha'])
+                datos_validos['hora'] = datos_validos['Fecha'].dt.hour
+                datos_validos['dia_semana'] = datos_validos['Fecha'].dt.dayofweek
+            
+            # Características de eficiencia
+            datos_validos['eficiencia_media_1h'] = datos_validos['IET_actual'].rolling(window=12, min_periods=1).mean()
+            datos_validos['tiempo_disponible_ratio'] = datos_validos['T. Disponible'] / datos_validos['T. Disponible'].mean()
+            datos_validos['microparadas_ratio'] = datos_validos['T. de Microparadas'] / datos_validos['T. de Microparadas'].mean()
+            
+            # Usar últimos datos
+            datos_recientes = datos_validos.tail(1)
+            X_pred = datos_recientes[self.feature_cols].fillna(0)
+            X_pred_scaled = self.scaler.transform(X_pred)
+            
+            # Predicción
+            valor_predicho = self.modelo.predict(X_pred_scaled)[0]
+            es_anomalia = False
+            if self.detector_anomalias is not None:
+                es_anomalia = self.detector_anomalias.predict(X_pred_scaled)[0] == -1
+            
+            # Confianza
+            r2_score_val = self.metricas_entrenamiento.get('r2', 0)
+            confianza_base = max(0, min(100, r2_score_val * 100))
+            confianza = confianza_base * (0.8 if es_anomalia else 1.0)
+            
+            # Factores de influencia
+            factores_influencia = {}
+            if hasattr(self.modelo, 'feature_importances_'):
+                for i, col in enumerate(self.feature_cols):
+                    factores_influencia[col] = round(self.modelo.feature_importances_[i] * 100, 1)
+            
+            return PrediccionResultado(
+                valor_predicho=round(valor_predicho, 2),
+                confianza=round(confianza, 1),
+                es_anomalia=es_anomalia,
+                factores_influencia=factores_influencia,
+                horizonte_temporal=f"{self.horizonte_horas} horas",
+                timestamp=datetime.datetime.now(),
+                metricas_modelo=self.metricas_entrenamiento
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error en predicción IET: {e}")
+            raise
 
 class ModeloPrediccionIPC(ModeloPrediccionBase):
     """Modelo específico para predicción de IPC (Índice de Productividad de Conteo)"""
@@ -396,23 +445,151 @@ class ModeloPrediccionIPC(ModeloPrediccionBase):
     
     def entrenar(self, datos: pd.DataFrame) -> Dict[str, float]:
         """Entrenar modelo de predicción IPC"""
-        # Implementación específica para IPC
-        return {'precisión': 80.0}
+        try:
+            self.logger.info(f"Entrenando modelo IPC con {len(datos)} registros")
+            
+            # Filtrar datos válidos para IPC
+            datos_validos = datos[
+                (datos['Conteo'].notna()) & 
+                (datos['Conteo'] > 0) &
+                (datos['T. Disponible'].notna()) &
+                (datos['T. Disponible'] > 0)
+            ].copy()
+            
+            if len(datos_validos) < 100:
+                raise ValueError("Datos insuficientes para IPC")
+            
+            # Calcular IPC actual (productividad por minuto disponible)
+            datos_validos['IPC_actual'] = (datos_validos['Conteo'] / datos_validos['T. Disponible']) * 100
+            
+            # Características temporales
+            if 'Fecha' in datos_validos.columns:
+                datos_validos['Fecha'] = pd.to_datetime(datos_validos['Fecha'])
+                datos_validos['hora'] = datos_validos['Fecha'].dt.hour
+                datos_validos['dia_semana'] = datos_validos['Fecha'].dt.dayofweek
+            
+            # Características de productividad
+            datos_validos['conteo_media_1h'] = datos_validos['Conteo'].rolling(window=12, min_periods=1).mean()
+            datos_validos['productividad_ratio'] = datos_validos['IPC_actual'] / datos_validos['IPC_actual'].mean()
+            
+            # Crear objetivo (IPC futuro)
+            datos_validos['IPC_objetivo'] = datos_validos['IPC_actual'].shift(-12)
+            
+            # Características de entrenamiento
+            feature_cols = ['hora', 'dia_semana', 'conteo_media_1h', 'productividad_ratio']
+            feature_cols = [col for col in feature_cols if col in datos_validos.columns]
+            
+            # Preparar datos
+            df_clean = datos_validos[feature_cols + ['IPC_objetivo']].dropna()
+            
+            if len(df_clean) < 50:
+                raise ValueError("Datos insuficientes después de limpieza")
+            
+            X = df_clean[feature_cols]
+            y = df_clean['IPC_objetivo']
+            
+            # Dividir y entrenar
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            
+            X_train_scaled = self.scaler.fit_transform(X_train)
+            X_test_scaled = self.scaler.transform(X_test)
+            
+            self.modelo.fit(X_train_scaled, y_train)
+            
+            # Calcular contamination dinámicamente
+            self.contamination_calculada = self._calcular_contamination_dinamico(X_train_scaled.flatten())
+            
+            # Crear detector de anomalías
+            self.detector_anomalias = IsolationForest(
+                contamination=self.contamination_calculada, 
+                random_state=42
+            )
+            self.detector_anomalias.fit(X_train_scaled)
+            
+            # Métricas
+            y_pred = self.modelo.predict(X_test_scaled)
+            self.metricas_entrenamiento = {
+                'mae': mean_absolute_error(y_test, y_pred),
+                'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
+                'r2': r2_score(y_test, y_pred),
+                'registros_entrenamiento': len(X_train),
+                'contamination_calculada': self.contamination_calculada
+            }
+            
+            self.modelo_entrenado = True
+            self.feature_cols = feature_cols
+            
+            self.logger.info(f"Modelo IPC entrenado. R²: {self.metricas_entrenamiento['r2']:.3f}, "
+                           f"Contamination: {self.contamination_calculada:.3f}")
+            
+            return self.metricas_entrenamiento
+            
+        except Exception as e:
+            self.logger.error(f"Error entrenando modelo IPC: {e}")
+            raise
     
     def predecir(self, datos_entrada: pd.DataFrame) -> PrediccionResultado:
         """Predecir IPC futuro"""
-        # Implementación específica para IPC
-        return PrediccionResultado(
-            valor_predicho=75.0,
-            confianza=80.0,
-            probabilidad_alerta=40,
-            estado='ALERTA',
-            factores_influencia={},
-            horizonte_temporal=f"{self.horizonte_horas} horas",
-            timestamp=datetime.datetime.now(),
-            metricas_modelo={'precisión': 80.0},
-            recomendaciones=["Optimizar capacidad de producción"]
-        )
+        if not self.modelo_entrenado:
+            raise ValueError("Modelo IPC no entrenado")
+        
+        try:
+            # Implementación similar a IET pero para IPC
+            datos_validos = datos_entrada[
+                (datos_entrada['Conteo'].notna()) & 
+                (datos_entrada['Conteo'] > 0) &
+                (datos_entrada['T. Disponible'].notna()) &
+                (datos_entrada['T. Disponible'] > 0)
+            ].copy()
+            
+            if len(datos_validos) == 0:
+                raise ValueError("No hay datos válidos para predicción IPC")
+            
+            # Calcular características necesarias
+            datos_validos['IPC_actual'] = (datos_validos['Conteo'] / datos_validos['T. Disponible']) * 100
+            
+            if 'Fecha' in datos_validos.columns:
+                datos_validos['Fecha'] = pd.to_datetime(datos_validos['Fecha'])
+                datos_validos['hora'] = datos_validos['Fecha'].dt.hour
+                datos_validos['dia_semana'] = datos_validos['Fecha'].dt.dayofweek
+            
+            datos_validos['conteo_media_1h'] = datos_validos['Conteo'].rolling(window=12, min_periods=1).mean()
+            datos_validos['productividad_ratio'] = datos_validos['IPC_actual'] / datos_validos['IPC_actual'].mean()
+            
+            # Predicción
+            datos_recientes = datos_validos.tail(1)
+            X_pred = datos_recientes[self.feature_cols].fillna(0)
+            X_pred_scaled = self.scaler.transform(X_pred)
+            
+            valor_predicho = self.modelo.predict(X_pred_scaled)[0]
+            es_anomalia = False
+            if self.detector_anomalias is not None:
+                es_anomalia = self.detector_anomalias.predict(X_pred_scaled)[0] == -1
+            
+            # Confianza
+            r2_score_val = self.metricas_entrenamiento.get('r2', 0)
+            confianza_base = max(0, min(100, r2_score_val * 100))
+            confianza = confianza_base * (0.8 if es_anomalia else 1.0)
+            
+            # Factores de influencia
+            factores_influencia = {}
+            if hasattr(self.modelo, 'feature_importances_'):
+                for i, col in enumerate(self.feature_cols):
+                    factores_influencia[col] = round(self.modelo.feature_importances_[i] * 100, 1)
+            
+            return PrediccionResultado(
+                valor_predicho=round(valor_predicho, 2),
+                confianza=round(confianza, 1),
+                es_anomalia=es_anomalia,
+                factores_influencia=factores_influencia,
+                horizonte_temporal=f"{self.horizonte_horas} horas",
+                timestamp=datetime.datetime.now(),
+                metricas_modelo=self.metricas_entrenamiento
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error en predicción IPC: {e}")
+            raise
 
 class GestorPredicciones:
     """Gestor principal para coordinar todos los modelos predictivos"""
@@ -435,7 +612,9 @@ class GestorPredicciones:
                 self.logger.info(f"Entrenando modelo {nombre}...")
                 resultado = modelo.entrenar(datos)
                 resultados_entrenamiento[nombre] = resultado
-                self.logger.info(f"Modelo {nombre} entrenado con precisión: {resultado.get('precisión', 0):.1f}%")
+                r2_score = resultado.get('r2', 0)
+                contamination = resultado.get('contamination_calculada', 'N/A')
+                self.logger.info(f"Modelo {nombre} entrenado. R²: {r2_score:.3f}, Contamination: {contamination}")
             except Exception as e:
                 self.logger.error(f"Error entrenando {nombre}: {e}")
                 resultados_entrenamiento[nombre] = {'error': str(e)}
@@ -455,7 +634,8 @@ class GestorPredicciones:
                 modelo.horizonte_horas = horizonte_horas
                 prediccion = modelo.predecir(datos)
                 predicciones[nombre] = prediccion
-                self.logger.info(f"Predicción {nombre}: {prediccion.valor_predicho} ({prediccion.estado})")
+                anomalia_str = " (ANOMALÍA)" if prediccion.es_anomalia else ""
+                self.logger.info(f"Predicción {nombre}: {prediccion.valor_predicho:.2f}{anomalia_str}")
             except Exception as e:
                 self.logger.error(f"Error prediciendo {nombre}: {e}")
                 predicciones[nombre] = None
@@ -472,13 +652,13 @@ class GestorPredicciones:
         output.append("=" * 80)
         
         # Resumen ejecutivo
-        alertas_criticas = sum(1 for p in predicciones.values() if p and p.estado == 'CRITICO')
-        alertas_atencion = sum(1 for p in predicciones.values() if p and p.estado == 'ALERTA')
+        predicciones_validas = [p for p in predicciones.values() if p is not None]
+        anomalias_detectadas = sum(1 for p in predicciones_validas if p.es_anomalia)
         
         output.append(f"\n[RESUMEN EJECUTIVO]")
-        output.append(f"Alertas críticas: {alertas_criticas}")
-        output.append(f"Alertas de atención: {alertas_atencion}")
-        output.append(f"Indicadores normales: {len(predicciones) - alertas_criticas - alertas_atencion}")
+        output.append(f"Total predicciones: {len(predicciones_validas)}")
+        output.append(f"Anomalías detectadas: {anomalias_detectadas}")
+        output.append(f"Predicciones normales: {len(predicciones_validas) - anomalias_detectadas}")
         
         # Predicciones detalladas
         for nombre, prediccion in predicciones.items():
@@ -486,16 +666,23 @@ class GestorPredicciones:
                 output.append(f"\n[{nombre}] ERROR - No se pudo generar predicción")
                 continue
             
-            output.append(f"\n[{nombre}] {prediccion.estado}")
-            output.append(f"  Valor predicho: {prediccion.valor_predicho}")
-            output.append(f"  Confianza: {prediccion.confianza}%")
-            output.append(f"  Probabilidad alerta: {prediccion.probabilidad_alerta}%")
+            anomalia_tag = " ⚠️ ANOMALÍA" if prediccion.es_anomalia else ""
+            output.append(f"\n[{nombre}]{anomalia_tag}")
+            output.append(f"  Valor predicho: {prediccion.valor_predicho:.2f}")
+            output.append(f"  Confianza: {prediccion.confianza:.1f}%")
             output.append(f"  Horizonte: {prediccion.horizonte_temporal}")
             
-            if incluir_detalles and prediccion.recomendaciones:
-                output.append(f"  Recomendaciones:")
-                for rec in prediccion.recomendaciones:
-                    output.append(f"    - {rec}")
+            # Mostrar contamination calculada si está disponible
+            if 'contamination_calculada' in prediccion.metricas_modelo:
+                cont = prediccion.metricas_modelo['contamination_calculada']
+                output.append(f"  Contamination calculada: {cont:.3f}")
+            
+            if incluir_detalles and prediccion.factores_influencia:
+                output.append(f"  Factores más influyentes:")
+                factores_ordenados = sorted(prediccion.factores_influencia.items(), 
+                                          key=lambda x: x[1], reverse=True)
+                for factor, importancia in factores_ordenados[:3]:
+                    output.append(f"    - {factor}: {importancia:.1f}%")
         
         return '\n'.join(output)
     
